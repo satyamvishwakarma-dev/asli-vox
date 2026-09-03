@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+data/raw/
+data/processed/
+*.pt
+*.pth
+*.ckpt
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+*.log
+.DS_Store
