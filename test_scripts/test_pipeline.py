@@ -1,6 +1,6 @@
 import streamlit as st
 
-from scripts.components import run_tests
+from test_scripts.components import run_tests
 
 st.title("Asli-Vox")
 st.subheader("Pipeline test dashboard")
