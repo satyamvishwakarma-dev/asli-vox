@@ -3,4 +3,4 @@ import uvicorn
 from asli_vox.api.main import app
 
 if __name__ == "__main__":
-    uvicorn.run("asli_vox.api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("asli_vox.api.main:app", port=8000, reload=True)
