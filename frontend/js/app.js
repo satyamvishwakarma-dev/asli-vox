@@ -22,12 +22,10 @@ const canvas = document.getElementById('waveformCanvas');
 const ctx = canvas.getContext('2d');
 
 let socket = null;
-let audioContext = null;
-let processor = null;
-let stream = null;
 let framesProcessed = 0;
 let lastTimestamp = 0;
 let filePlaybackInterval = null;
+let workletNode = null;
 
 function resizeCanvas() {
     if (!canvas || !canvas.parentElement) return;
@@ -109,7 +107,6 @@ function ensureSocketConnection() {
             if (frameCounter) frameCounter.innerText = framesProcessed;
             if (windowSizeText) windowSizeText.innerText = `${data.buffered_seconds}s`;
 
-            // Debug log every response
             console.log("[AsliVox Telemetry]", data);
             updateTelemetry(data);
         };
@@ -129,64 +126,55 @@ if (micBtn) {
     });
 }
 
-// Clean linear downsampler to 16kHz
-function downsampleTo16k(inputData, inputSampleRate) {
-    if (inputSampleRate === 16000) return inputData;
-    const ratio = inputSampleRate / 16000;
-    const newLength = Math.round(inputData.length / ratio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetInput = 0;
-    while (offsetResult < result.length) {
-        const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
-        let accum = 0, count = 0;
-        for (let i = offsetInput; i < nextOffsetInput && i < inputData.length; i++) {
-            accum += inputData[i];
-            count++;
+// --- Inline Audio Worklet Definition ---
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.bufferSize = 4096;
+        this.buffer = new Float32Array(this.bufferSize);
+        this.bytesWritten = 0;
+    }
+    process(inputs, outputs) {
+        const input = inputs[0];
+        if (!input || !input[0]) return true;
+        const channelData = input[0];
+        
+        for (let i = 0; i < channelData.length; i++) {
+            this.buffer[this.bytesWritten++] = channelData[i];
+            if (this.bytesWritten >= this.bufferSize) {
+                // CRITICAL FIX: Copy the buffer so the microphone doesn't overwrite it mid-transit
+                this.port.postMessage(new Float32Array(this.buffer)); 
+                this.bytesWritten = 0;
+            }
         }
-        result[offsetResult] = count > 0 ? accum / count : inputData[offsetInput];
-        offsetResult++;
-        offsetInput = nextOffsetInput;
+        return true;
     }
-    return result;
 }
-// Clean linear downsampler to 16kHz
-function downsampleTo16k(inputData, inputSampleRate) {
-    if (inputSampleRate === 16000) return inputData;
-    const ratio = inputSampleRate / 16000;
-    const newLength = Math.round(inputData.length / ratio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetInput = 0;
-    while (offsetResult < result.length) {
-        const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
-        let accum = 0, count = 0;
-        for (let i = offsetInput; i < nextOffsetInput && i < inputData.length; i++) {
-            accum += inputData[i];
-            count++;
-        }
-        result[offsetResult] = count > 0 ? accum / count : inputData[offsetInput];
-        offsetResult++;
-        offsetInput = nextOffsetInput;
-    }
-    return result;
-}
-
-function encodeFloat32ToBase64(float32Array) {
-    const uint8Array = new Uint8Array(float32Array.buffer, float32Array.byteOffset, float32Array.byteLength);
-    let binary = '';
-    const len = uint8Array.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(uint8Array[i]);
-    }
-    return window.btoa(binary);
-}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
 
 async function startPipeline() {
     try {
         await ensureSocketConnection();
 
-        // Pin directly to window to prevent V8 Garbage Collection drops
+        // 1. Force the browser's native audio engine to use 16kHz with anti-aliasing
+        const audioCtxOptions = { sampleRate: 16000 };
+        window._asliAudioCtx = new (window.AudioContext || window.webkitAudioContext)(audioCtxOptions);
+        
+        if (window._asliAudioCtx.state === 'suspended') {
+            await window._asliAudioCtx.resume();
+        }
+
+        const actualSR = window._asliAudioCtx.sampleRate;
+        console.log(`[AsliVox] AudioContext initialized cleanly at: ${actualSR} Hz`);
+
+        // 2. Load the inline worklet
+        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(blob);
+        await window._asliAudioCtx.audioWorklet.addModule(workletUrl);
+
+        // 3. Get microphone without aggressive browser processing
         window._asliStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 channelCount: 1,
@@ -197,42 +185,35 @@ async function startPipeline() {
             video: false
         });
 
-        window._asliAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        if (window._asliAudioCtx.state === 'suspended') {
-            await window._asliAudioCtx.resume();
-        }
-
-        const nativeSR = window._asliAudioCtx.sampleRate;
-        console.log(`[AsliVox] Capturing audio at native hardware rate: ${nativeSR} Hz`);
-
         if (micBtn) {
             micBtn.classList.add('active');
             if (micBtnText) micBtnText.innerText = "Halt interceptor";
         }
 
         window._asliSource = window._asliAudioCtx.createMediaStreamSource(window._asliStream);
-        
-        // 4096 samples buffer
-        window._asliProcessor = window._asliAudioCtx.createScriptProcessor(4096, 1, 1);
+        workletNode = new AudioWorkletNode(window._asliAudioCtx, 'pcm-processor');
 
-        window._asliProcessor.onaudioprocess = (e) => {
-            const rawChannel = e.inputBuffer.getChannelData(0);
-            drawOscilloscope(rawChannel);
+        // 4. Handle clean 16kHz chunks
+        workletNode.port.onmessage = (event) => {
+            const rawChannel = event.data; // This is now natively 16kHz!
+            
+            if (typeof drawOscilloscope === 'function') {
+                drawOscilloscope(rawChannel);
+            }
 
-            const downsampled16k = downsampleTo16k(rawChannel, nativeSR);
-
+            // Stream directly to backend without JS math
             if (socket && socket.readyState === WebSocket.OPEN) {
                 lastTimestamp = performance.now();
-                socket.send(JSON.stringify({ audio: encodeFloat32ToBase64(downsampled16k) }));
+                socket.send(JSON.stringify({ audio: encodeFloat32ToBase64(rawChannel) }));
             }
         };
 
-        window._asliSource.connect(window._asliProcessor);
+        window._asliSource.connect(workletNode);
 
-        // A live gain path is strictly required by Chromium to keep the processor thread active
+        // Required Chromium gain path to keep the thread alive
         window._asliMuteGain = window._asliAudioCtx.createGain();
         window._asliMuteGain.gain.value = 0.0;
-        window._asliProcessor.connect(window._asliMuteGain);
+        workletNode.connect(window._asliMuteGain);
         window._asliMuteGain.connect(window._asliAudioCtx.destination);
 
     } catch (err) {
@@ -247,10 +228,15 @@ async function stopPipeline() {
         filePlaybackInterval = null;
     }
 
-    if (window._asliProcessor) {
-        window._asliProcessor.disconnect();
-        window._asliProcessor.onaudioprocess = null;
-        window._asliProcessor = null;
+    if (workletNode) {
+        workletNode.disconnect();
+        workletNode.port.onmessage = null;
+        workletNode = null;
+    }
+
+    if (window._asliMuteGain) {
+        window._asliMuteGain.disconnect();
+        window._asliMuteGain = null;
     }
 
     if (window._asliSource) {
@@ -315,6 +301,7 @@ function updateTelemetry(data) {
         }
     }
 }
+
 const audioFileInput = document.getElementById('audioFileInput');
 
 if (audioFileInput) {
