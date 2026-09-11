@@ -3,106 +3,144 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AsliVox – Real-Time Voice Deepfake & Spoof Detection</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <title>AsliVox | Neural Voice Shield</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="static/style.css">
 </head>
 <body>
-<div id="root">
-    <header class="app-header">
-        <div class="logo-badge">SIH 2026 • SIH26104</div>
-        <h1>AsliVox</h1>
-        <p class="subtitle">Real-Time AI Voice Deepfake & Anti-Spoofing Detection Engine</p>
-    </header>
+    <!-- Living background: audio-reactive signal field -->
+    <canvas id="bgField"></canvas>
+    <div class="bg-vignette"></div>
+    <div class="bg-scanline"></div>
 
-    <!-- Main Grid Dashboard -->
-    <main class="dashboard-grid">
-        <!-- Left Panel: Live Audio & Authenticity Meter -->
-        <div class="panel panel-left">
-            <!-- Authenticity meter -->
-            <section class="card meter-card">
-                <h2>Voice Authenticity</h2>
-                <div id="meter"><svg></svg></div>
-                <div id="meter-text">Authenticity: Ready</div>
-            </section>
+    <div class="app-layout">
+        <!-- Top Navigation -->
+        <header class="cyber-header">
+            <div class="brand">
+                <div class="brand-badge">SIH26104</div>
+                <div class="brand-title">Asli<span>Vox</span></div>
+                <div class="brand-sub">Neural real-time spoof interceptor</div>
+            </div>
+            <div class="system-status">
+                <div class="status-indicator">
+                    <span class="indicator-dot" id="systemDot"></span>
+                    <span id="systemStatusText">CORE OFFLINE</span>
+                </div>
+                <div class="chip">CPU inference</div>
+                <div class="chip">LCNN&#8209;MFM</div>
+            </div>
+        </header>
 
-            <!-- Live waveform visualizer -->
-            <section class="card waveform-card">
-                <div class="card-header">
-                    <h2>Live Oscilloscope</h2>
-                    <span class="live-pill">16 kHz PCM</span>
+        <!-- Main Content Dashboard -->
+        <main class="dashboard-grid">
+            <!-- Left: Input & Oscilloscope -->
+            <section class="surface-zone" id="inputPanel">
+                <div class="panel-header">
+                    <h2>Acoustic telemetry stream</h2>
                 </div>
-                <canvas id="waveform"></canvas>
-            </section>
 
-            <!-- Control buttons -->
-            <section class="card controls-card">
-                <div class="buttons-row">
-                    <button id="recordBtn" class="btn btn-primary" disabled>🎙️ Record (mic)</button>
-                    <button id="uploadBtn" class="btn btn-secondary">📁 Upload Audio (.wav)</button>
-                    <input type="file" id="fileInput" accept="audio/*,.wav,.mp3,.ogg,.flac" style="display:none">
+                <div class="controls-toolbar">
+                    <button id="micBtn" class="cyber-button">
+                        <span class="btn-glitch"></span>
+                        <span class="btn-ring"></span>
+                        <span class="btn-label" id="micBtnText">Engage sensors</span>
+                    </button>
+                    <div class="audio-specs">
+                        <div>Rate: <span>16.0 kHz</span></div>
+                        <div>Window: <span id="windowSizeText">0.00s</span> / 3.0s</div>
+                    </div>
                 </div>
-                <div class="control-hints">Click <strong>Record</strong> to stream mic audio via WebSocket, or <strong>Upload</strong> a .wav file.</div>
-            </section>
-        </div>
 
-        <!-- Right Panel: Verdict & Explainability Heatmap -->
-        <div class="panel panel-right">
-            <!-- Verdict readout -->
-            <section id="verdict" class="card verdict-card" style="display:none;">
-                <div class="card-header">
-                    <h2>Detection Verdict</h2>
+                <div class="oscilloscope-wrapper">
+                    <canvas id="waveformCanvas"></canvas>
+                    <div class="scope-hud-tags">
+                        <span>Band: 80&#8209;mel channels</span>
+                        <span>Resample: 16000 S/s</span>
+                    </div>
                 </div>
-                <div class="verdict-content">
-                    <div id="verdict-label" class="verdict-title">--</div>
-                    <div id="verdict-confidence" class="verdict-confidence">Confidence: --%</div>
-                </div>
-            </section>
 
-            <!-- Grad-CAM heatmap -->
-            <section class="card heatmap-card">
-                <div class="card-header">
-                    <h2>Acoustic Artifact Heatmap</h2>
-                    <span class="pill-info">Grad-CAM Overlay</span>
-                </div>
-                <div class="heatmap-wrapper">
-                    <img id="heatmap" src="" alt="Grad-CAM heatmap" style="opacity: 0.3;">
-                </div>
-                <div id="heatmap-caption" class="caption">Waiting for voice input to compute spectrogram heatmap...</div>
-            </section>
-
-            <!-- Session history -->
-            <section id="history" class="card history-card small">
-                <div class="card-header">
-                    <strong>Session History</strong>
-                    <span style="font-size:0.75rem; color:var(--muted);">Recent Detections</span>
-                </div>
-                <div id="history-list" class="history-container">
-                    <div class="empty-history">No recent scans yet. Record speech or upload audio.</div>
+                <div class="stats-counter-row">
+                    <div class="counter-box">
+                        <span class="label">Est. latency</span>
+                        <span class="val" id="latencyVal">-- ms</span>
+                    </div>
+                    <div class="counter-box">
+                        <span class="label">Frames evaluated</span>
+                        <span class="val" id="frameCounter">0</span>
+                    </div>
+                    <div class="counter-box">
+                        <span class="label">VAD status</span>
+                        <span class="val" id="vadStatus">Standby</span>
+                    </div>
                 </div>
             </section>
-        </div>
-    </main>
 
-    <footer class="app-footer">
-        <span>AsliVox Engine • Fast Inference • Team Apex SIH 2026</span>
-    </footer>
-</div>
+            <!-- Right: Authenticity Core & Grad-CAM -->
+            <section class="surface-zone" id="verdictPanel">
+                <div class="panel-header">
+                    <h2>Authenticity verification engine</h2>
+                </div>
 
-<!-- JS modules (order matters) -->
-<script type="module">
-    import {initAPI, sendRecord, sendFile, onResult} from "/static/js/api.js";
-    import {initWaveform} from "/static/js/waveform.js";
-    import {initMeter} from "/static/js/meter.js";
-    import {initHeatmap} from "/static/js/heatmap.js";
-    import {initApp} from "/static/js/app.js";
+                <div class="threat-matrix">
+                    <div class="verdict-banner" id="verdictBanner">
+                        <div class="verdict-pulse"></div>
+                        <div class="banner-title" id="verdictTitle">System ready</div>
+                        <div class="banner-subtitle" id="verdictSub">Awaiting acoustic payload</div>
+                    </div>
 
-    document.addEventListener('DOMContentLoaded', () => {
-        initAPI();                     // sets up WS + REST base URL
-        initWaveform();               // canvas setup
-        initMeter();                  // circular meter SVG
-        initHeatmap();                // image container
-        initApp();                    // wire record/upload + UI updates
-    });
-</script>
+                    <div class="probability-block">
+                        <div class="prob-header">
+                            <span>Spoof probability index</span>
+                            <span id="probPercent">0.00%</span>
+                        </div>
+                        <div class="neon-track">
+                            <div class="neon-progress" id="probBar"></div>
+                            <div class="threshold-line" title="Trigger threshold (65%)"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="explainability-module">
+                    <div class="module-title">
+                        <span>Grad-CAM anomaly heatmap</span>
+                        <span class="target-layer">Target: conv2d_last</span>
+                    </div>
+
+                    <div class="heatmap-frame" id="heatmapFrame">
+                        <img id="heatmapImg" src="" alt="Grad-CAM Anomaly Map" style="display: none;">
+                        <div class="radar-scan" id="radarSweep"></div>
+                        <div class="heatmap-idle" id="heatmapPlaceholder">
+                            <div class="crosshair"></div>
+                            <span>Awaiting high&#8209;risk anomaly activation</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Architecture Deep-Dive -->
+        <section class="deep-dive-section">
+            <h3 class="section-divider">Architecture &amp; inference pipeline</h3>
+            <div class="cards-trio">
+                <div class="info-card">
+                    <h4>Log-mel frontend</h4>
+                    <p>Converts streaming 16kHz PCM audio buffers into 80-bin mel-frequency representations using a 25ms window and 10ms frame hop for feature tracking.</p>
+                </div>
+                <div class="info-card">
+                    <h4>Lightweight CNN (MFM)</h4>
+                    <p>Employs max-feature-map competitive activation layers to halve parameter density, achieving native ~15ms CPU inference without GPU acceleration.</p>
+                </div>
+                <div class="info-card">
+                    <h4>Backpropagated Grad-CAM</h4>
+                    <p>Directly visualizes high-frequency voice synthesis artifacts by mapping convolutional gradient activations back to the audio spectrogram plane.</p>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="static/js/bg-field.js"></script>
+    <script src="static/js/app.js"></script>
 </body>
 </html>

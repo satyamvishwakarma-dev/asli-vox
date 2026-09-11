@@ -1,271 +1,195 @@
-// app.js – Main application controller wiring UI, Audio, WebSocket & REST
-// -----------------------------------------------------------------------------
+const micBtn = document.getElementById('micBtn');
+const micBtnText = document.getElementById('micBtnText');
+const systemDot = document.getElementById('systemDot');
+const systemStatusText = document.getElementById('systemStatusText');
 
-import { sendRecord, sendChunk, sendFinish, sendFile, fetchHistory } from './api.js';
+const verdictBanner = document.getElementById('verdictBanner');
+const verdictTitle = document.getElementById('verdictTitle');
+const verdictSub = document.getElementById('verdictSub');
 
-let isRecording = false;
-let mediaStream = null;
-let mediaRecorder = null;
-let recordedChunks = [];
+const probBar = document.getElementById('probBar');
+const probPercent = document.getElementById('probPercent');
+const windowSizeText = document.getElementById('windowSizeText');
+const latencyVal = document.getElementById('latencyVal');
+const frameCounter = document.getElementById('frameCounter');
+const vadStatus = document.getElementById('vadStatus');
 
-export function initApp() {
-    const recordBtn = document.getElementById('recordBtn');
-    const uploadBtn = document.getElementById('uploadBtn');
-    const verdictSection = document.getElementById('verdict');
-    const verdictLabel = document.getElementById('verdict-label');
-    const verdictConfidence = document.getElementById('verdict-confidence');
-    const historyList = document.getElementById('history-list');
+const heatmapImg = document.getElementById('heatmapImg');
+const heatmapPlaceholder = document.getElementById('heatmapPlaceholder');
+const radarSweep = document.getElementById('radarSweep');
 
-    // Create hidden file input for audio uploads
-    let fileInput = document.getElementById('fileInput');
-    if (!fileInput) {
-        fileInput = document.createElement('input');
-        fileInput.type = 'file';
-        fileInput.id = 'fileInput';
-        fileInput.accept = 'audio/*,.wav,.mp3,.ogg,.flac';
-        fileInput.style.display = 'none';
-        document.body.appendChild(fileInput);
-    }
+const canvas = document.getElementById('waveformCanvas');
+const ctx = canvas.getContext('2d');
 
-    // Enable record button once app is initialized
-    if (recordBtn) {
-        recordBtn.disabled = false;
-        recordBtn.addEventListener('click', toggleRecording);
-    }
+let socket = null;
+let audioContext = null;
+let processor = null;
+let stream = null;
+let framesProcessed = 0;
+let lastTimestamp = 0;
 
-    // Upload button triggers hidden file input
-    if (uploadBtn) {
-        uploadBtn.addEventListener('click', () => {
-            fileInput.value = '';
-            fileInput.click();
-        });
-    }
+// Setup High-DPI canvas
+function resizeCanvas() {
+    canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+    canvas.height = canvas.parentElement.clientHeight * window.devicePixelRatio;
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
 
-    // File input change listener
-    fileInput.addEventListener('change', async (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
+function drawOscilloscope(dataArray) {
+    const width = canvas.parentElement.clientWidth;
+    const height = canvas.parentElement.clientHeight;
 
-        showStatus(`Uploading and analyzing ${file.name}...`);
-        if (uploadBtn) uploadBtn.disabled = true;
+    ctx.clearRect(0, 0, width, height);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#0aeaff';
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = 'rgba(10, 234, 255, 0.8)';
+    ctx.beginPath();
 
-        try {
-            await sendFile(file);
-        } catch (err) {
-            console.error('Upload detection failed:', err);
-            alert(`Analysis failed: ${err.message || err}`);
-        } finally {
-            if (uploadBtn) uploadBtn.disabled = false;
-        }
-    });
+    const sliceWidth = width / dataArray.length;
+    let x = 0;
 
-    // Handle WebSocket connection state
-    document.addEventListener('asliVox:wsReady', (e) => {
-        const status = e.detail?.status;
-        console.log(`WebSocket status changed: ${status}`);
-    });
+    for (let i = 0; i < dataArray.length; i++) {
+        const v = dataArray[i]; // Amplitude: -1.0 to 1.0
+        const y = ((v + 1) / 2) * height;
 
-    // Listen for detection results from WebSocket or REST
-    document.addEventListener('asliVox:result', (e) => {
-        const result = e.detail;
-        if (!result) return;
-        renderResult(result);
-    });
-
-    // Initial session history fetch
-    loadHistory();
-
-    // -------------------------------------------------------------------------
-    // Microphone Recording Logic
-    // -------------------------------------------------------------------------
-    async function toggleRecording() {
-        if (!isRecording) {
-            await startRecording();
+        if (i === 0) {
+            ctx.moveTo(x, y);
         } else {
-            await stopRecording();
+            ctx.lineTo(x, y);
         }
+        x += sliceWidth;
     }
 
-    async function startRecording() {
-        try {
-            recordedChunks = [];
-            mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    channelCount: 1,
-                    sampleRate: 16000,
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false,
-                }
-            });
+    ctx.lineTo(width, height / 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+}
 
-            // Start waveform visualization
-            if (window.__waveform && typeof window.__waveform.start === 'function') {
-                window.__waveform.start(mediaStream);
+micBtn.addEventListener('click', async () => {
+    if (micBtn.classList.contains('active')) {
+        stopPipeline();
+    } else {
+        await startPipeline();
+    }
+});
+
+async function startPipeline() {
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        audioContext = new AudioContext({ sampleRate: 16000 });
+
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+        socket.onopen = () => {
+            systemDot.classList.add('active');
+            systemStatusText.innerText = "STREAM ONLINE";
+            micBtn.classList.add('active');
+            micBtnText.innerText = "Halt interceptor";
+            vadStatus.innerText = "Active";
+            radarSweep.style.display = "block";
+        };
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            const now = performance.now();
+            if (lastTimestamp) {
+                const latency = Math.round(now - lastTimestamp);
+                latencyVal.innerText = `${latency} ms`;
             }
 
-            // Prefer audio/webm or audio/wav supported by browser
-            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                ? 'audio/webm;codecs=opus'
-                : (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' : '');
+            framesProcessed++;
+            frameCounter.innerText = framesProcessed;
+            windowSizeText.innerText = `${data.buffered_seconds}s`;
 
-            const options = mimeType ? { mimeType } : {};
-            mediaRecorder = new MediaRecorder(mediaStream, options);
+            updateTelemetry(data);
+        };
 
-            mediaRecorder.ondataavailable = (ev) => {
-                if (ev.data && ev.data.size > 0) {
-                    recordedChunks.push(ev.data);
-                    // Stream chunk to WebSocket
-                    ev.data.arrayBuffer().then(buffer => {
-                        sendChunk(buffer);
-                    });
+        socket.onclose = () => {
+            stopPipeline();
+        };
+
+        const source = audioContext.createMediaStreamSource(stream);
+        // ScriptProcessor: 4096 samples = 256ms chunk @ 16kHz
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+            const channelData = e.inputBuffer.getChannelData(0);
+            drawOscilloscope(channelData);
+
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                lastTimestamp = performance.now();
+                // Send raw PCM Float32 buffer as base64 string
+                const buffer = new Uint8Array(channelData.buffer);
+                let binary = '';
+                for (let i = 0; i < buffer.byteLength; i++) {
+                    binary += String.fromCharCode(buffer[i]);
                 }
-            };
-
-            mediaRecorder.onstop = () => {
-                // When recording stops, package all chunks and send finish marker
-                if (recordedChunks.length > 0) {
-                    const fullBlob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/wav' });
-                    sendRecord(fullBlob);
-                } else {
-                    sendFinish();
-                }
-            };
-
-            // Request slices every 400ms for live streaming detection
-            mediaRecorder.start(400);
-            isRecording = true;
-
-            // Update button UI
-            recordBtn.textContent = '⏹ Stop Recording';
-            recordBtn.classList.add('recording');
-            showStatus('Listening to microphone in real-time...');
-
-        } catch (err) {
-            console.error('Microphone access denied or error:', err);
-            alert(`Microphone error: ${err.message || 'Permission denied. Please grant microphone access.'}`);
-            isRecording = false;
-        }
-    }
-
-    async function stopRecording() {
-        isRecording = false;
-
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-            mediaRecorder.stop();
-        }
-
-        if (mediaStream) {
-            mediaStream.getTracks().forEach(track => track.stop());
-            mediaStream = null;
-        }
-
-        if (window.__waveform && typeof window.__waveform.stop === 'function') {
-            window.__waveform.stop();
-        }
-
-        if (recordBtn) {
-            recordBtn.textContent = '🎙️ Record (Mic)';
-            recordBtn.classList.remove('recording');
-        }
-
-        showStatus('Processing audio capture...');
-    }
-
-    // -------------------------------------------------------------------------
-    // UI Rendering
-    // -------------------------------------------------------------------------
-    function renderResult(result) {
-        const { verdict, confidence, heatmap_base64, timestamp, audio_duration_sec, details } = result;
-
-        // 1. Update Authenticity Meter
-        if (window.__meter && typeof window.__meter.setConfidence === 'function') {
-            window.__meter.setConfidence(confidence, verdict);
-        }
-
-        // 2. Update Grad-CAM Heatmap
-        if (window.__heatmap && typeof window.__heatmap.update === 'function') {
-            window.__heatmap.update(heatmap_base64, verdict);
-        }
-
-        // 3. Update Verdict Readout
-        if (verdictSection) {
-            verdictSection.style.display = 'block';
-            verdictSection.className = `verdict-banner ${verdict}`;
-
-            if (verdictLabel) {
-                verdictLabel.textContent = verdict === 'bonafide'
-                    ? '✅ GENUINE VOICE (BONAFIDE)'
-                    : '🚨 AI DEEPFAKE DETECTED (SPOOF)';
-                verdictLabel.className = `verdict-title ${verdict}`;
+                socket.send(JSON.stringify({ audio: btoa(binary) }));
             }
+        };
 
-            if (verdictConfidence) {
-                const pct = (confidence * 100).toFixed(1);
-                const durStr = audio_duration_sec ? ` • Duration: ${audio_duration_sec}s` : '';
-                const modelStr = details?.model_source ? ` • Engine: ${details.model_source}` : '';
-                verdictConfidence.textContent = `Confidence: ${pct}%${durStr}${modelStr}`;
-            }
-        }
+        source.connect(processor);
+        processor.connect(audioContext.destination);
 
-        // 4. Prepend to Session History Strip
-        addHistoryItemToDOM({
-            id: details?.id || Math.random().toString(36).substring(7),
-            verdict,
-            confidence,
-            timestamp: timestamp || new Date().toISOString(),
-            source: isRecording ? 'live' : 'upload',
-            audio_duration_sec,
-        });
+    } catch (err) {
+        alert("Failed to initialize audio input: " + err.message);
+        stopPipeline();
     }
+}
 
-    function addHistoryItemToDOM(item) {
-        if (!historyList) return;
+function stopPipeline() {
+    if (processor) processor.disconnect();
+    if (audioContext) audioContext.close();
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (socket) socket.close();
 
-        // Remove placeholder empty state if present
-        const emptyMsg = historyList.querySelector('.empty-history');
-        if (emptyMsg) emptyMsg.remove();
+    micBtn.classList.remove('active');
+    micBtnText.innerText = "Engage sensors";
+    systemDot.classList.remove('active');
+    systemStatusText.innerText = "CORE OFFLINE";
+    vadStatus.innerText = "Standby";
+    radarSweep.style.display = "none";
+    latencyVal.innerText = "-- ms";
 
-        const row = document.createElement('div');
-        row.className = `history-item ${item.verdict}`;
+    verdictBanner.className = 'verdict-banner';
+    verdictTitle.innerText = "System ready";
+    verdictSub.innerText = "Awaiting acoustic payload";
+    probBar.style.width = "0%";
+    probBar.style.backgroundColor = "var(--verified-green)";
+    probBar.style.boxShadow = "0 0 10px var(--verified-green)";
+    probPercent.innerText = "0.00%";
+}
 
-        const timeStr = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : 'Now';
-        const isBonafide = item.verdict === 'bonafide';
-        const pct = Math.round(item.confidence * 100);
-        const badgeColor = isBonafide ? '#00ff99' : '#ff3366';
-        const icon = isBonafide ? '🟢' : '🔴';
-        const sourceIcon = item.source === 'live' ? '🎙️' : '📁';
+function updateTelemetry(data) {
+    const spoofProb = data.confidence;
+    const percentStr = (spoofProb * 100).toFixed(2);
+    probPercent.innerText = `${percentStr}%`;
+    probBar.style.width = `${percentStr}%`;
 
-        row.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; padding: 0.4rem 0.6rem;">
-                <span>${icon} <strong>${item.verdict.toUpperCase()}</strong> (${pct}%)</span>
-                <span style="font-size:0.75rem; color:#8fa0b5;">${sourceIcon} ${timeStr}</span>
-            </div>
-        `;
+    if (data.verdict === 'spoof') {
+        verdictBanner.className = 'verdict-banner spoof';
+        verdictTitle.innerText = "Synthetic spoof detected";
+        verdictSub.innerText = `Critical anomaly: risk index exceeds operating barrier (${data.threshold})`;
+        probBar.style.backgroundColor = "var(--alert-red)";
+        probBar.style.boxShadow = "0 0 10px var(--alert-red)";
 
-        historyList.prepend(row);
-
-        // Keep maximum 10 items in DOM
-        while (historyList.children.length > 10) {
-            historyList.removeChild(historyList.lastChild);
+        if (data.heatmap) {
+            heatmapImg.src = "data:image/png;base64," + data.heatmap;
+            heatmapImg.style.display = "block";
+            heatmapPlaceholder.style.display = "none";
         }
-    }
+    } else {
+        verdictBanner.className = 'verdict-banner bonafide';
+        verdictTitle.innerText = "Bonafide voice pattern";
+        verdictSub.innerText = "Acoustic envelope matches authentic human vocal resonance.";
+        probBar.style.backgroundColor = "var(--verified-green)";
+        probBar.style.boxShadow = "0 0 10px var(--verified-green)";
 
-    async function loadHistory() {
-        if (!historyList) return;
-        const history = await fetchHistory();
-        if (history && history.length > 0) {
-            historyList.innerHTML = '';
-            history.forEach(item => addHistoryItemToDOM(item));
-        } else {
-            historyList.innerHTML = '<div class="empty-history" style="padding:0.5rem; color:#64748b;">No recent scans yet. Record speech or upload a .wav file.</div>';
-        }
-    }
-
-    function showStatus(text) {
-        const statusEl = document.getElementById('meter-status');
-        if (statusEl) {
-            statusEl.textContent = text;
-        }
+        heatmapImg.style.display = "none";
+        heatmapPlaceholder.style.display = "flex";
     }
 }

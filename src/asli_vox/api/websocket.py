@@ -1,167 +1,119 @@
-"""WebSocket endpoint for real-time live microphone streaming detection."""
+import base64
 import json
-from datetime import datetime, timezone
-from typing import Optional
+import logging
+import os
+import cv2
 import numpy as np
-
+import torch
+import torch.nn.functional as F
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from asli_vox.config import settings
-from asli_vox.utils.logger import logger
-from asli_vox.utils.audio import load_audio_from_bytes, is_silent_or_empty, vad_chunk_audio
+from asli_vox.explainability.gradcam import GradCAM
 from asli_vox.features.spectrogram import extract_logmel
-from asli_vox.features.embeddings import extract_xlsr_embedding
-from asli_vox.models.lightgbm_baseline import classify
-from asli_vox.explainability.gradcam import generate_gradcam_heatmap
-from asli_vox.api.routes import add_history_entry
+from asli_vox.models.lcnn import LCNN
 
+logger = logging.getLogger("asli_vox.websocket")
+router = APIRouter()
 
-router = APIRouter(tags=["WebSocket Detection"])
+SAMPLE_RATE = 16000
+CHUNK_SECONDS = 3
+TARGET_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
+SPOOF_DECISION_THRESHOLD = 0.65
 
+device = torch.device("cpu")
+model = LCNN(num_classes=2).to(device)
 
-def _process_audio_chunk(raw_bytes: bytes) -> Optional[dict]:
-    """
-    Safely process accumulated audio bytes through the full detection pipeline.
-    Never raises an exception — returns safe neutral payload on error or silence.
-    """
-    ts = datetime.now(timezone.utc).isoformat()
-
-    if not raw_bytes or len(raw_bytes) < 320:  # < 10ms
-        return None
-
+MODEL_WEIGHTS_PATH = os.path.join(os.getcwd(), "model_weights.pth")
+if os.path.exists(MODEL_WEIGHTS_PATH):
     try:
-        audio, sr = load_audio_from_bytes(raw_bytes, target_sr=settings.SAMPLE_RATE)
-        duration = float(len(audio) / sr) if len(audio) > 0 else 0.0
+        model.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=device))
+        logger.info(f"Loaded checkpoint: {MODEL_WEIGHTS_PATH}")
+    except Exception as err:
+        logger.error(f"Checkpoint error: {err}. Using initialized model.")
+else:
+    logger.warning("No model_weights.pth found. Using initialized model.")
 
-        # Handle silence or near-zero energy
-        if is_silent_or_empty(audio):
-            dummy_mel = extract_logmel(np.zeros(sr, dtype=np.float32))
-            heatmap_b64 = generate_gradcam_heatmap(dummy_mel, verdict="bonafide")
-            return {
-                "verdict": "bonafide",
-                "confidence": 0.50,
-                "heatmap_base64": heatmap_b64,
-                "timestamp": ts,
-                "audio_duration_sec": round(duration, 2),
-                "is_speech": False,
-                "details": {"note": "Silent or non-vocal audio frame."},
-            }
+model.eval()
+cam = GradCAM(model, model.features[-1])
 
-        # VAD segmentation
-        intervals = vad_chunk_audio(audio, sr=sr, aggressiveness=settings.VAD_AGGRESSIVENESS)
-        has_speech = len(intervals) > 0
+def prepare_audio_tensor(raw_floats: np.ndarray, target_length: int = TARGET_SAMPLES) -> torch.Tensor:
+    if len(raw_floats) < target_length:
+        padded = np.pad(raw_floats, (0, target_length - len(raw_floats)), mode="constant")
+    else:
+        padded = raw_floats[-target_length:]
+    return torch.from_numpy(padded).float()
 
-        # Log-mel Spectrogram
-        logmel = extract_logmel(
-            audio,
-            sr=sr,
-            n_mels=settings.N_MELS,
-            n_fft=settings.N_FFT,
-            hop_length=settings.HOP_LENGTH,
-        )
-
-        # Classification (LightGBM or heuristic baseline stub)
-        res = classify(logmel, audio, sr=sr)
-        verdict = res["verdict"]
-        confidence = res["confidence"]
-
-        # Grad-CAM Heatmap
-        heatmap_b64 = generate_gradcam_heatmap(logmel, verdict=verdict)
-
-        # Record to session history
-        add_history_entry(verdict, confidence, source="live", duration=duration)
-
-        return {
-            "verdict": verdict,
-            "confidence": confidence,
-            "heatmap_base64": heatmap_b64,
-            "timestamp": ts,
-            "audio_duration_sec": round(duration, 2),
-            "is_speech": has_speech,
-            "details": {
-                "model_source": res["model_source"],
-                "spoof_probability": res["spoof_probability"],
-            },
-        }
-
-    except Exception as exc:
-        logger.error(f"Error processing streaming audio chunk: {exc}", exc_info=True)
-        # Never crash the websocket connection on bad input
-        dummy_mel = extract_logmel(np.zeros(settings.SAMPLE_RATE, dtype=np.float32))
-        return {
-            "verdict": "bonafide",
-            "confidence": 0.50,
-            "heatmap_base64": generate_gradcam_heatmap(dummy_mel, verdict="bonafide"),
-            "timestamp": ts,
-            "audio_duration_sec": 0.0,
-            "is_speech": False,
-            "details": {"error": str(exc)},
-        }
-
-
-@router.websocket("/ws/detect")
-async def websocket_detect(websocket: WebSocket):
-    """
-    WebSocket endpoint accepting live audio data from browser microphone.
-    Supports:
-      - Binary audio frames (PCM 16-bit 16kHz or WAV chunks)
-      - Text control messages: {"type": "finish"}, {"type": "reset"}
-    Returns structured JSON: verdict, confidence, heatmap_base64, timestamp.
-    Guaranteed not to crash the connection on bad or silent audio.
-    """
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("WebSocket client connected to /ws/detect")
-
-    buffer = bytearray()
-    # 1.0 second of 16-bit mono 16kHz PCM = 32000 bytes
-    min_stream_bytes = int(settings.SAMPLE_RATE * 2 * settings.STREAM_WINDOW_SEC)
+    logger.info("WebSocket connection accepted.")
+    audio_stream_buffer = np.array([], dtype=np.float32)
 
     try:
         while True:
-            msg = await websocket.receive()
+            raw_message = await websocket.receive_text()
+            if not raw_message:
+                continue
 
-            if "bytes" in msg and msg["bytes"] is not None:
-                data = msg["bytes"]
-                buffer.extend(data)
+            try:
+                payload = json.loads(raw_message)
+            except Exception:
+                continue
 
-                # If enough audio accumulated for live window
-                if len(buffer) >= min_stream_bytes:
-                    payload = _process_audio_chunk(bytes(buffer))
-                    if payload is not None:
-                        await websocket.send_json(payload)
-                    # Keep a 50% sliding overlap window
-                    keep_bytes = min_stream_bytes // 2
-                    buffer = buffer[-keep_bytes:]
+            audio_b64 = payload.get("audio", "")
+            if not audio_b64:
+                continue
 
-            elif "text" in msg and msg["text"] is not None:
-                try:
-                    cmd = json.loads(msg["text"])
-                except Exception:
-                    cmd = {"type": msg["text"].strip().lower()}
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+                new_samples = np.frombuffer(audio_bytes, dtype=np.float32)
+            except Exception:
+                continue
 
-                action = cmd.get("type", "")
+            if new_samples.size == 0:
+                continue
 
-                if action == "finish":
-                    # Client finished recording: process whatever remains in buffer
-                    if len(buffer) > 0:
-                        payload = _process_audio_chunk(bytes(buffer))
-                        if payload is not None:
-                            await websocket.send_json(payload)
-                        buffer.clear()
+            audio_stream_buffer = np.concatenate([audio_stream_buffer, new_samples])
+            if len(audio_stream_buffer) > TARGET_SAMPLES:
+                audio_stream_buffer = audio_stream_buffer[-TARGET_SAMPLES:]
 
-                elif action == "reset":
-                    buffer.clear()
-                    await websocket.send_json({"status": "buffer_cleared"})
+            # Preprocess: guarantees (1, 1, 80, time)
+            waveform_tensor = prepare_audio_tensor(audio_stream_buffer, TARGET_SAMPLES)
+            mel_spec = extract_logmel(waveform_tensor, sample_rate=SAMPLE_RATE).to(device)
+            if mel_spec.ndim == 4:
+                mel_spec = mel_spec[0:1]
+            mel_spec = mel_spec.reshape(1, 1, 80, -1)
 
-                elif action == "ping":
-                    await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
+            with torch.set_grad_enabled(True):
+                logits = model(mel_spec)
+                probs = F.softmax(logits.view(1, -1), dim=-1)
+                spoof_prob = float(probs[0, 1].item()) if probs.shape[1] > 1 else float(probs[0, 0].item())
+
+                heatmap_b64 = ""
+                if spoof_prob >= 0.40:
+                    try:
+                        heatmap_array = cam.generate_heatmap(mel_spec, class_idx=1)
+                        if heatmap_array is not None and isinstance(heatmap_array, np.ndarray) and heatmap_array.size > 0:
+                            # Fix UMat/OpenCV typing: explicitly cast contiguous uint8 array
+                            heatmap_norm = np.ascontiguousarray(np.clip(heatmap_array * 255.0, 0, 255), dtype=np.uint8)
+                            heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+                            _, encoded_img = cv2.imencode(".png", heatmap_color)
+                            heatmap_b64 = base64.b64encode(encoded_img).decode("utf-8")
+                    except Exception as cam_err:
+                        logger.warning(f"GradCAM frame skipped: {cam_err}")
+                        heatmap_b64 = ""
+
+            verdict = "spoof" if spoof_prob >= SPOOF_DECISION_THRESHOLD else "bonafide"
+
+            await websocket.send_json({
+                "verdict": verdict,
+                "confidence": round(spoof_prob, 4),
+                "threshold": SPOOF_DECISION_THRESHOLD,
+                "heatmap": heatmap_b64,
+                "buffered_seconds": round(len(audio_stream_buffer) / SAMPLE_RATE, 2)
+            })
 
     except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected normally.")
+        logger.info("Client disconnected.")
     except Exception as exc:
-        logger.warning(f"WebSocket session error: {exc}")
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        logger.error(f"WebSocket loop exception: {exc}")
