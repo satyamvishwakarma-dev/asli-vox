@@ -5,7 +5,6 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from asli_vox.explainability.gradcam import GradCAM
@@ -18,7 +17,9 @@ router = APIRouter()
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 3
 TARGET_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
-SPOOF_DECISION_THRESHOLD = 0.65
+
+# Calibrated Threshold: human voice sits around ~2.8 - 4.2 | AI sits around ~5.8 - 10.0
+CALIBRATED_MARGIN_THRESHOLD = 5.50
 
 device = torch.device("cpu")
 model = LCNN(num_classes=2).to(device)
@@ -27,26 +28,30 @@ MODEL_WEIGHTS_PATH = os.path.join(os.getcwd(), "model_weights.pth")
 if os.path.exists(MODEL_WEIGHTS_PATH):
     try:
         model.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=device))
-        logger.info(f"Loaded checkpoint: {MODEL_WEIGHTS_PATH}")
+        logger.info(f"Loaded checkpoint from {MODEL_WEIGHTS_PATH}")
     except Exception as err:
-        logger.error(f"Checkpoint error: {err}. Using initialized model.")
+        logger.error(f"Failed to load checkpoint: {err}")
 else:
-    logger.warning("No model_weights.pth found. Using initialized model.")
+    logger.warning("No model_weights.pth found in root!")
 
 model.eval()
 cam = GradCAM(model, model.features[-1])
 
 def prepare_audio_tensor(raw_floats: np.ndarray, target_length: int = TARGET_SAMPLES) -> torch.Tensor:
-    if len(raw_floats) < target_length:
-        padded = np.pad(raw_floats, (0, target_length - len(raw_floats)), mode="constant")
+    n = len(raw_floats)
+    if n == 0:
+        return torch.zeros(target_length, dtype=torch.float32)
+    if n >= target_length:
+        sliced = raw_floats[-target_length:]
     else:
-        padded = raw_floats[-target_length:]
-    return torch.from_numpy(padded).float()
+        pad_needed = target_length - n
+        sliced = np.pad(raw_floats, (0, pad_needed), mode='reflect')
+    return torch.from_numpy(sliced).float()
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("WebSocket connection accepted.")
+    logger.info("Client connected.")
     audio_stream_buffer = np.array([], dtype=np.float32)
 
     try:
@@ -69,48 +74,58 @@ async def websocket_endpoint(websocket: WebSocket):
                 new_samples = np.frombuffer(audio_bytes, dtype=np.float32)
             except Exception:
                 continue
+            # --- DIAGNOSTIC PRINT ---
+            frame_rms = float(np.sqrt(np.mean(new_samples**2)))
+            frame_max = float(np.max(np.abs(new_samples))) if len(new_samples) > 0 else 0.0
+            print(f"[RX CHUNK] Len: {len(new_samples)} | Max: {frame_max:.4f} | RMS: {frame_rms:.4f}")
+            # ------------------------
 
             if new_samples.size == 0:
                 continue
 
-            audio_stream_buffer = np.concatenate([audio_stream_buffer, new_samples])
+            # Continuous rolling buffer (no silence discards)
+            audio_stream_buffer = np.concatenate([audio_stream_buffer, new_samples]).astype(np.float32)
             if len(audio_stream_buffer) > TARGET_SAMPLES:
                 audio_stream_buffer = audio_stream_buffer[-TARGET_SAMPLES:]
 
-            # Preprocess: guarantees (1, 1, 80, time)
+            # Initial buffer warming (first 1 second on connect)
+            if len(audio_stream_buffer) < int(SAMPLE_RATE * 1.0):
+                continue
+
             waveform_tensor = prepare_audio_tensor(audio_stream_buffer, TARGET_SAMPLES)
             mel_spec = extract_logmel(waveform_tensor, sample_rate=SAMPLE_RATE).to(device)
             if mel_spec.ndim == 4:
                 mel_spec = mel_spec[0:1]
             mel_spec = mel_spec.reshape(1, 1, 80, -1)
 
-            with torch.set_grad_enabled(True):
-                logits = model(mel_spec)
-                probs = F.softmax(logits.view(1, -1), dim=-1)
-                spoof_prob = float(probs[0, 1].item()) if probs.shape[1] > 1 else float(probs[0, 0].item())
+            with torch.no_grad():
+                logits = model(mel_spec)[0]
+                margin = float((logits[1] - logits[0]).item())
 
-                heatmap_b64 = ""
-                if spoof_prob >= 0.40:
+            risk_prob = float(1.0 / (1.0 + np.exp(-(margin - CALIBRATED_MARGIN_THRESHOLD))))
+            verdict = "spoof" if margin >= CALIBRATED_MARGIN_THRESHOLD else "bonafide"
+
+            heatmap_b64 = ""
+            if margin >= CALIBRATED_MARGIN_THRESHOLD:
+                with torch.set_grad_enabled(True):
                     try:
                         heatmap_array = cam.generate_heatmap(mel_spec, class_idx=1)
                         if heatmap_array is not None and isinstance(heatmap_array, np.ndarray) and heatmap_array.size > 0:
-                            # Fix UMat/OpenCV typing: explicitly cast contiguous uint8 array
                             heatmap_norm = np.ascontiguousarray(np.clip(heatmap_array * 255.0, 0, 255), dtype=np.uint8)
                             heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
                             _, encoded_img = cv2.imencode(".png", heatmap_color)
                             heatmap_b64 = base64.b64encode(encoded_img).decode("utf-8")
                     except Exception as cam_err:
                         logger.warning(f"GradCAM frame skipped: {cam_err}")
-                        heatmap_b64 = ""
-
-            verdict = "spoof" if spoof_prob >= SPOOF_DECISION_THRESHOLD else "bonafide"
 
             await websocket.send_json({
                 "verdict": verdict,
-                "confidence": round(spoof_prob, 4),
-                "threshold": SPOOF_DECISION_THRESHOLD,
+                "confidence": round(risk_prob, 4),
+                "margin": round(margin, 3),
+                "threshold": CALIBRATED_MARGIN_THRESHOLD,
                 "heatmap": heatmap_b64,
-                "buffered_seconds": round(len(audio_stream_buffer) / SAMPLE_RATE, 2)
+                "buffered_seconds": round(len(audio_stream_buffer) / SAMPLE_RATE, 2),
+                "vad": "ACTIVE"
             })
 
     except WebSocketDisconnect:

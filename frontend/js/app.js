@@ -27,6 +27,7 @@ let processor = null;
 let stream = null;
 let framesProcessed = 0;
 let lastTimestamp = 0;
+let filePlaybackInterval = null;
 
 function resizeCanvas() {
     if (!canvas || !canvas.parentElement) return;
@@ -69,13 +70,14 @@ function drawOscilloscope(dataArray) {
     ctx.shadowBlur = 0;
 }
 
-function encodeFloat32ToBase64(channelData) {
-    const buffer = new Uint8Array(channelData.buffer);
+function encodeFloat32ToBase64(float32Array) {
+    const uint8Array = new Uint8Array(float32Array.buffer, float32Array.byteOffset, float32Array.byteLength);
     let binary = '';
-    for (let i = 0; i < buffer.byteLength; i++) {
-        binary += String.fromCharCode(buffer[i]);
+    const len = uint8Array.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(uint8Array[i]);
     }
-    return btoa(binary);
+    return window.btoa(binary);
 }
 
 function ensureSocketConnection() {
@@ -127,52 +129,111 @@ if (micBtn) {
     });
 }
 
+// Clean linear downsampler to 16kHz
+function downsampleTo16k(inputData, inputSampleRate) {
+    if (inputSampleRate === 16000) return inputData;
+    const ratio = inputSampleRate / 16000;
+    const newLength = Math.round(inputData.length / ratio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetInput = 0;
+    while (offsetResult < result.length) {
+        const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
+        let accum = 0, count = 0;
+        for (let i = offsetInput; i < nextOffsetInput && i < inputData.length; i++) {
+            accum += inputData[i];
+            count++;
+        }
+        result[offsetResult] = count > 0 ? accum / count : inputData[offsetInput];
+        offsetResult++;
+        offsetInput = nextOffsetInput;
+    }
+    return result;
+}
+// Clean linear downsampler to 16kHz
+function downsampleTo16k(inputData, inputSampleRate) {
+    if (inputSampleRate === 16000) return inputData;
+    const ratio = inputSampleRate / 16000;
+    const newLength = Math.round(inputData.length / ratio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetInput = 0;
+    while (offsetResult < result.length) {
+        const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
+        let accum = 0, count = 0;
+        for (let i = offsetInput; i < nextOffsetInput && i < inputData.length; i++) {
+            accum += inputData[i];
+            count++;
+        }
+        result[offsetResult] = count > 0 ? accum / count : inputData[offsetInput];
+        offsetResult++;
+        offsetInput = nextOffsetInput;
+    }
+    return result;
+}
+
+function encodeFloat32ToBase64(float32Array) {
+    const uint8Array = new Uint8Array(float32Array.buffer, float32Array.byteOffset, float32Array.byteLength);
+    let binary = '';
+    const len = uint8Array.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(uint8Array[i]);
+    }
+    return window.btoa(binary);
+}
+
 async function startPipeline() {
     try {
         await ensureSocketConnection();
 
-        stream = await navigator.mediaDevices.getUserMedia({
+        // Pin directly to window to prevent V8 Garbage Collection drops
+        window._asliStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 channelCount: 1,
-                sampleRate: 16000,
                 echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false
+                autoGainControl: false,
+                noiseSuppression: false
             },
             video: false
         });
 
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-
-        if (audioContext.state === 'suspended') {
-            await audioContext.resume();
+        window._asliAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (window._asliAudioCtx.state === 'suspended') {
+            await window._asliAudioCtx.resume();
         }
+
+        const nativeSR = window._asliAudioCtx.sampleRate;
+        console.log(`[AsliVox] Capturing audio at native hardware rate: ${nativeSR} Hz`);
 
         if (micBtn) {
             micBtn.classList.add('active');
             if (micBtnText) micBtnText.innerText = "Halt interceptor";
         }
 
-        const source = audioContext.createMediaStreamSource(stream);
-        // 4096 samples = ~256ms chunk @ 16kHz
-        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        window._asliSource = window._asliAudioCtx.createMediaStreamSource(window._asliStream);
+        
+        // 4096 samples buffer
+        window._asliProcessor = window._asliAudioCtx.createScriptProcessor(4096, 1, 1);
 
-        processor.onaudioprocess = (e) => {
-            const channelData = e.inputBuffer.getChannelData(0);
-            drawOscilloscope(channelData);
+        window._asliProcessor.onaudioprocess = (e) => {
+            const rawChannel = e.inputBuffer.getChannelData(0);
+            drawOscilloscope(rawChannel);
+
+            const downsampled16k = downsampleTo16k(rawChannel, nativeSR);
 
             if (socket && socket.readyState === WebSocket.OPEN) {
                 lastTimestamp = performance.now();
-                socket.send(JSON.stringify({ audio: encodeFloat32ToBase64(channelData) }));
+                socket.send(JSON.stringify({ audio: encodeFloat32ToBase64(downsampled16k) }));
             }
         };
 
-        source.connect(processor);
+        window._asliSource.connect(window._asliProcessor);
 
-        const muteGain = audioContext.createGain();
-        muteGain.gain.value = 0.0;
-        processor.connect(muteGain);
-        muteGain.connect(audioContext.destination);
+        // A live gain path is strictly required by Chromium to keep the processor thread active
+        window._asliMuteGain = window._asliAudioCtx.createGain();
+        window._asliMuteGain.gain.value = 0.0;
+        window._asliProcessor.connect(window._asliMuteGain);
+        window._asliMuteGain.connect(window._asliAudioCtx.destination);
 
     } catch (err) {
         alert("Audio initialization error: " + err.message);
@@ -181,84 +242,55 @@ async function startPipeline() {
 }
 
 async function stopPipeline() {
-    if (processor) {
-        try { processor.disconnect(); } catch (e) {}
-        processor = null;
+    if (filePlaybackInterval) {
+        clearInterval(filePlaybackInterval);
+        filePlaybackInterval = null;
     }
 
-    if (stream) {
-        try { stream.getTracks().forEach(track => track.stop()); } catch (e) {}
-        stream = null;
+    if (window._asliProcessor) {
+        window._asliProcessor.disconnect();
+        window._asliProcessor.onaudioprocess = null;
+        window._asliProcessor = null;
     }
 
-    if (audioContext) {
-        if (audioContext.state !== 'closed') {
-            try { await audioContext.close(); } catch (e) {}
-        }
-        audioContext = null;
+    if (window._asliSource) {
+        window._asliSource.disconnect();
+        window._asliSource = null;
     }
 
-    if (socket) {
-        socket.onclose = null;
-        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-            socket.close();
-        }
-        socket = null;
+    if (window._asliStream) {
+        window._asliStream.getTracks().forEach(track => track.stop());
+        window._asliStream = null;
+    }
+
+    if (window._asliAudioCtx) {
+        await window._asliAudioCtx.close();
+        window._asliAudioCtx = null;
     }
 
     if (micBtn) {
         micBtn.classList.remove('active');
         if (micBtnText) micBtnText.innerText = "Engage sensors";
     }
-
-    if (systemDot) systemDot.classList.remove('active');
-    if (systemStatusText) systemStatusText.innerText = "CORE OFFLINE";
-    if (vadStatus) vadStatus.innerText = "Standby";
-    if (radarSweep) radarSweep.style.display = "none";
-    if (latencyVal) latencyVal.innerText = "-- ms";
-
-    if (verdictBanner) {
-        verdictBanner.className = 'verdict-banner';
-        if (verdictTitle) verdictTitle.innerText = "System ready";
-        if (verdictSub) verdictSub.innerText = "Awaiting acoustic payload";
-    }
-
-    if (probBar) {
-        probBar.style.width = "0%";
-        probBar.style.backgroundColor = "var(--verified-green)";
-        probBar.style.boxShadow = "0 0 10px var(--verified-green)";
-    }
-    if (probPercent) probPercent.innerText = "0.00%";
 }
 
 function updateTelemetry(data) {
-    if (vadStatus) vadStatus.innerText = data.vad || "ACTIVE";
+    if (vadStatus) vadStatus.innerText = "STREAMING";
 
-    if (data.verdict === 'silent') {
-        if (verdictBanner) {
-            verdictBanner.className = 'verdict-banner';
-            if (verdictTitle) verdictTitle.innerText = "Listening / Silence";
-            if (verdictSub) verdictSub.innerText = "Waiting for audible speech...";
-        }
-        if (probBar) probBar.style.width = "0%";
-        if (probPercent) probPercent.innerText = "0.00%";
-        return;
-    }
-
-    const spoofProb = data.confidence;
-    const percentStr = (spoofProb * 100).toFixed(2);
+    const riskScore = data.confidence;
+    const percentStr = (riskScore * 100).toFixed(1);
     if (probPercent) probPercent.innerText = `${percentStr}%`;
     if (probBar) probBar.style.width = `${percentStr}%`;
 
     if (data.verdict === 'spoof') {
         if (verdictBanner) {
             verdictBanner.className = 'verdict-banner spoof';
-            if (verdictTitle) verdictTitle.innerText = "Synthetic spoof detected";
-            if (verdictSub) verdictSub.innerText = `Spoof probability: ${percentStr}% (Threshold: ${data.threshold})`;
+            if (verdictTitle) verdictTitle.innerText = "SYNTHETIC SPOOF DETECTED";
+            if (verdictSub) verdictSub.innerText = `CRITICAL ANOMALY: LLR Margin ${data.margin} (Threshold: ${data.threshold})`;
         }
         if (probBar) {
             probBar.style.backgroundColor = "var(--alert-red)";
-            probBar.style.boxShadow = "0 0 10px var(--alert-red)";
+            probBar.style.boxShadow = "0 0 12px var(--alert-red)";
         }
 
         if (data.heatmap && heatmapImg && heatmapPlaceholder) {
@@ -269,12 +301,12 @@ function updateTelemetry(data) {
     } else {
         if (verdictBanner) {
             verdictBanner.className = 'verdict-banner bonafide';
-            if (verdictTitle) verdictTitle.innerText = "Bonafide voice pattern";
-            if (verdictSub) verdictSub.innerText = `Authentic human speech confirmed (${(100 - spoofProb * 100).toFixed(2)}% confidence)`;
+            if (verdictTitle) verdictTitle.innerText = "BONAFIDE VOICE PATTERN";
+            if (verdictSub) verdictSub.innerText = `Human vocal harmonics verified (LLR Margin: ${data.margin} < ${data.threshold})`;
         }
         if (probBar) {
             probBar.style.backgroundColor = "var(--verified-green)";
-            probBar.style.boxShadow = "0 0 10px var(--verified-green)";
+            probBar.style.boxShadow = "0 0 12px var(--verified-green)";
         }
 
         if (heatmapImg && heatmapPlaceholder) {
@@ -282,4 +314,32 @@ function updateTelemetry(data) {
             heatmapPlaceholder.style.display = "flex";
         }
     }
+}
+const audioFileInput = document.getElementById('audioFileInput');
+
+if (audioFileInput) {
+    audioFileInput.addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        if (verdictBanner) {
+            verdictBanner.className = 'verdict-banner';
+            if (verdictTitle) verdictTitle.innerText = "ANALYZING FILE...";
+            if (verdictSub) verdictSub.innerText = `Evaluating acoustic resonance for ${file.name}`;
+        }
+
+        try {
+            const res = await fetch('/api/verify-file', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await res.json();
+            updateTelemetry(data);
+        } catch (err) {
+            alert("Analysis failed: " + err.message);
+        }
+    });
 }

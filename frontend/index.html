@@ -42,16 +42,20 @@
                 </div>
 
                 <div class="controls-toolbar">
-                    <button id="micBtn" class="cyber-button">
-                        <span class="btn-glitch"></span>
-                        <span class="btn-ring"></span>
-                        <span class="btn-label" id="micBtnText">Engage sensors</span>
-                    </button>
-                    <div class="audio-specs">
-                        <div>Rate: <span>16.0 kHz</span></div>
-                        <div>Window: <span id="windowSizeText">0.00s</span> / 3.0s</div>
-                    </div>
-                </div>
+    <button id="micBtn" class="cyber-button">
+        <span class="btn-label" id="micBtnText">Engage sensors</span>
+    </button>
+
+    <label for="audioFileInput" class="cyber-button" style="cursor: pointer; margin-bottom: 0;">
+        <span class="btn-label">📁 Inject Test File</span>
+    </label>
+    <input type="file" id="audioFileInput" accept=".mp3,.wav,.flac" style="display: none;" />
+
+    <div class="audio-specs">
+        <div>RATE: <span>16.0 kHz</span></div>
+        <div>WINDOW: <span id="windowSizeText">0.00s</span> / 3.0s</div>
+    </div>
+</div>
 
                 <div class="oscilloscope-wrapper">
                     <canvas id="waveformCanvas"></canvas>
