@@ -11,3 +11,5 @@ data/processed/
 notebooks/.ipynb_checkpoints/
 *.log
 .DS_Store
+
+test_scripts/

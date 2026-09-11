@@ -28,8 +28,8 @@ let stream = null;
 let framesProcessed = 0;
 let lastTimestamp = 0;
 
-// Setup High-DPI canvas
 function resizeCanvas() {
+    if (!canvas || !canvas.parentElement) return;
     canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
     canvas.height = canvas.parentElement.clientHeight * window.devicePixelRatio;
     ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
@@ -38,6 +38,7 @@ window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
 
 function drawOscilloscope(dataArray) {
+    if (!canvas || !canvas.parentElement) return;
     const width = canvas.parentElement.clientWidth;
     const height = canvas.parentElement.clientHeight;
 
@@ -52,7 +53,7 @@ function drawOscilloscope(dataArray) {
     let x = 0;
 
     for (let i = 0; i < dataArray.length; i++) {
-        const v = dataArray[i]; // Amplitude: -1.0 to 1.0
+        const v = dataArray[i];
         const y = ((v + 1) / 2) * height;
 
         if (i === 0) {
@@ -68,52 +69,92 @@ function drawOscilloscope(dataArray) {
     ctx.shadowBlur = 0;
 }
 
-micBtn.addEventListener('click', async () => {
-    if (micBtn.classList.contains('active')) {
-        stopPipeline();
-    } else {
-        await startPipeline();
+function encodeFloat32ToBase64(channelData) {
+    const buffer = new Uint8Array(channelData.buffer);
+    let binary = '';
+    for (let i = 0; i < buffer.byteLength; i++) {
+        binary += String.fromCharCode(buffer[i]);
     }
-});
+    return btoa(binary);
+}
 
-async function startPipeline() {
-    try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        audioContext = new AudioContext({ sampleRate: 16000 });
+function ensureSocketConnection() {
+    return new Promise((resolve, reject) => {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            resolve(socket);
+            return;
+        }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
         socket.onopen = () => {
-            systemDot.classList.add('active');
-            systemStatusText.innerText = "STREAM ONLINE";
-            micBtn.classList.add('active');
-            micBtnText.innerText = "Halt interceptor";
-            vadStatus.innerText = "Active";
-            radarSweep.style.display = "block";
+            if (systemDot) systemDot.classList.add('active');
+            if (systemStatusText) systemStatusText.innerText = "STREAM ONLINE";
+            if (vadStatus) vadStatus.innerText = "Active";
+            if (radarSweep) radarSweep.style.display = "block";
+            resolve(socket);
         };
 
         socket.onmessage = (event) => {
             const data = JSON.parse(event.data);
             const now = performance.now();
-            if (lastTimestamp) {
-                const latency = Math.round(now - lastTimestamp);
-                latencyVal.innerText = `${latency} ms`;
+            if (lastTimestamp && latencyVal) {
+                latencyVal.innerText = `${Math.round(now - lastTimestamp)} ms`;
             }
 
             framesProcessed++;
-            frameCounter.innerText = framesProcessed;
-            windowSizeText.innerText = `${data.buffered_seconds}s`;
+            if (frameCounter) frameCounter.innerText = framesProcessed;
+            if (windowSizeText) windowSizeText.innerText = `${data.buffered_seconds}s`;
 
+            // Debug log every response
+            console.log("[AsliVox Telemetry]", data);
             updateTelemetry(data);
         };
 
-        socket.onclose = () => {
-            stopPipeline();
-        };
+        socket.onerror = (err) => reject(err);
+        socket.onclose = () => stopPipeline();
+    });
+}
+
+if (micBtn) {
+    micBtn.addEventListener('click', async () => {
+        if (micBtn.classList.contains('active')) {
+            await stopPipeline();
+        } else {
+            await startPipeline();
+        }
+    });
+}
+
+async function startPipeline() {
+    try {
+        await ensureSocketConnection();
+
+        stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                sampleRate: 16000,
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false
+            },
+            video: false
+        });
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+
+        if (micBtn) {
+            micBtn.classList.add('active');
+            if (micBtnText) micBtnText.innerText = "Halt interceptor";
+        }
 
         const source = audioContext.createMediaStreamSource(stream);
-        // ScriptProcessor: 4096 samples = 256ms chunk @ 16kHz
+        // 4096 samples = ~256ms chunk @ 16kHz
         processor = audioContext.createScriptProcessor(4096, 1, 1);
 
         processor.onaudioprocess = (e) => {
@@ -122,74 +163,123 @@ async function startPipeline() {
 
             if (socket && socket.readyState === WebSocket.OPEN) {
                 lastTimestamp = performance.now();
-                // Send raw PCM Float32 buffer as base64 string
-                const buffer = new Uint8Array(channelData.buffer);
-                let binary = '';
-                for (let i = 0; i < buffer.byteLength; i++) {
-                    binary += String.fromCharCode(buffer[i]);
-                }
-                socket.send(JSON.stringify({ audio: btoa(binary) }));
+                socket.send(JSON.stringify({ audio: encodeFloat32ToBase64(channelData) }));
             }
         };
 
         source.connect(processor);
-        processor.connect(audioContext.destination);
+
+        const muteGain = audioContext.createGain();
+        muteGain.gain.value = 0.0;
+        processor.connect(muteGain);
+        muteGain.connect(audioContext.destination);
 
     } catch (err) {
-        alert("Failed to initialize audio input: " + err.message);
-        stopPipeline();
+        alert("Audio initialization error: " + err.message);
+        await stopPipeline();
     }
 }
 
-function stopPipeline() {
-    if (processor) processor.disconnect();
-    if (audioContext) audioContext.close();
-    if (stream) stream.getTracks().forEach(track => track.stop());
-    if (socket) socket.close();
+async function stopPipeline() {
+    if (processor) {
+        try { processor.disconnect(); } catch (e) {}
+        processor = null;
+    }
 
-    micBtn.classList.remove('active');
-    micBtnText.innerText = "Engage sensors";
-    systemDot.classList.remove('active');
-    systemStatusText.innerText = "CORE OFFLINE";
-    vadStatus.innerText = "Standby";
-    radarSweep.style.display = "none";
-    latencyVal.innerText = "-- ms";
+    if (stream) {
+        try { stream.getTracks().forEach(track => track.stop()); } catch (e) {}
+        stream = null;
+    }
 
-    verdictBanner.className = 'verdict-banner';
-    verdictTitle.innerText = "System ready";
-    verdictSub.innerText = "Awaiting acoustic payload";
-    probBar.style.width = "0%";
-    probBar.style.backgroundColor = "var(--verified-green)";
-    probBar.style.boxShadow = "0 0 10px var(--verified-green)";
-    probPercent.innerText = "0.00%";
+    if (audioContext) {
+        if (audioContext.state !== 'closed') {
+            try { await audioContext.close(); } catch (e) {}
+        }
+        audioContext = null;
+    }
+
+    if (socket) {
+        socket.onclose = null;
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+            socket.close();
+        }
+        socket = null;
+    }
+
+    if (micBtn) {
+        micBtn.classList.remove('active');
+        if (micBtnText) micBtnText.innerText = "Engage sensors";
+    }
+
+    if (systemDot) systemDot.classList.remove('active');
+    if (systemStatusText) systemStatusText.innerText = "CORE OFFLINE";
+    if (vadStatus) vadStatus.innerText = "Standby";
+    if (radarSweep) radarSweep.style.display = "none";
+    if (latencyVal) latencyVal.innerText = "-- ms";
+
+    if (verdictBanner) {
+        verdictBanner.className = 'verdict-banner';
+        if (verdictTitle) verdictTitle.innerText = "System ready";
+        if (verdictSub) verdictSub.innerText = "Awaiting acoustic payload";
+    }
+
+    if (probBar) {
+        probBar.style.width = "0%";
+        probBar.style.backgroundColor = "var(--verified-green)";
+        probBar.style.boxShadow = "0 0 10px var(--verified-green)";
+    }
+    if (probPercent) probPercent.innerText = "0.00%";
 }
 
 function updateTelemetry(data) {
+    if (vadStatus) vadStatus.innerText = data.vad || "ACTIVE";
+
+    if (data.verdict === 'silent') {
+        if (verdictBanner) {
+            verdictBanner.className = 'verdict-banner';
+            if (verdictTitle) verdictTitle.innerText = "Listening / Silence";
+            if (verdictSub) verdictSub.innerText = "Waiting for audible speech...";
+        }
+        if (probBar) probBar.style.width = "0%";
+        if (probPercent) probPercent.innerText = "0.00%";
+        return;
+    }
+
     const spoofProb = data.confidence;
     const percentStr = (spoofProb * 100).toFixed(2);
-    probPercent.innerText = `${percentStr}%`;
-    probBar.style.width = `${percentStr}%`;
+    if (probPercent) probPercent.innerText = `${percentStr}%`;
+    if (probBar) probBar.style.width = `${percentStr}%`;
 
     if (data.verdict === 'spoof') {
-        verdictBanner.className = 'verdict-banner spoof';
-        verdictTitle.innerText = "Synthetic spoof detected";
-        verdictSub.innerText = `Critical anomaly: risk index exceeds operating barrier (${data.threshold})`;
-        probBar.style.backgroundColor = "var(--alert-red)";
-        probBar.style.boxShadow = "0 0 10px var(--alert-red)";
+        if (verdictBanner) {
+            verdictBanner.className = 'verdict-banner spoof';
+            if (verdictTitle) verdictTitle.innerText = "Synthetic spoof detected";
+            if (verdictSub) verdictSub.innerText = `Spoof probability: ${percentStr}% (Threshold: ${data.threshold})`;
+        }
+        if (probBar) {
+            probBar.style.backgroundColor = "var(--alert-red)";
+            probBar.style.boxShadow = "0 0 10px var(--alert-red)";
+        }
 
-        if (data.heatmap) {
+        if (data.heatmap && heatmapImg && heatmapPlaceholder) {
             heatmapImg.src = "data:image/png;base64," + data.heatmap;
             heatmapImg.style.display = "block";
             heatmapPlaceholder.style.display = "none";
         }
     } else {
-        verdictBanner.className = 'verdict-banner bonafide';
-        verdictTitle.innerText = "Bonafide voice pattern";
-        verdictSub.innerText = "Acoustic envelope matches authentic human vocal resonance.";
-        probBar.style.backgroundColor = "var(--verified-green)";
-        probBar.style.boxShadow = "0 0 10px var(--verified-green)";
+        if (verdictBanner) {
+            verdictBanner.className = 'verdict-banner bonafide';
+            if (verdictTitle) verdictTitle.innerText = "Bonafide voice pattern";
+            if (verdictSub) verdictSub.innerText = `Authentic human speech confirmed (${(100 - spoofProb * 100).toFixed(2)}% confidence)`;
+        }
+        if (probBar) {
+            probBar.style.backgroundColor = "var(--verified-green)";
+            probBar.style.boxShadow = "0 0 10px var(--verified-green)";
+        }
 
-        heatmapImg.style.display = "none";
-        heatmapPlaceholder.style.display = "flex";
+        if (heatmapImg && heatmapPlaceholder) {
+            heatmapImg.style.display = "none";
+            heatmapPlaceholder.style.display = "flex";
+        }
     }
 }

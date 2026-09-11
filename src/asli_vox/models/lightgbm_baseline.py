@@ -5,6 +5,7 @@ exist yet, it provides a clearly-commented acoustic heuristic baseline that eval
 real spectral properties (high-frequency rolloff, vocoder artifacts, dynamic range)
 to produce realistic bonafide/spoof confidence scores for the end-to-end demo.
 """
+
 from pathlib import Path
 from typing import Dict, Any, Optional
 import numpy as np
@@ -35,6 +36,7 @@ def _try_load_model():
         if p.is_file():
             try:
                 import joblib
+
                 _MODEL = joblib.load(p)
                 _MODEL_LOADED = True
                 logger.info(f"Successfully loaded trained LightGBM model from {p}")
@@ -42,7 +44,9 @@ def _try_load_model():
             except Exception as e:
                 logger.warning(f"Failed loading model from {p}: {e}")
 
-    logger.info("No trained LightGBM model file found. Using acoustic heuristic baseline stub.")
+    logger.info(
+        "No trained LightGBM model file found. Using acoustic heuristic baseline stub."
+    )
     return None
 
 
@@ -52,7 +56,9 @@ def is_model_loaded() -> bool:
     return _MODEL_LOADED
 
 
-def extract_features_for_tabular(logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 16000) -> np.ndarray:
+def extract_features_for_tabular(
+    logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 16000
+) -> np.ndarray:
     """
     Extract a compact 1D feature vector from (1, n_mels, time) log-mel spectrogram
     and time-domain audio suitable for LightGBM.
@@ -61,9 +67,9 @@ def extract_features_for_tabular(logmel: np.ndarray, audio: Optional[np.ndarray]
 
     # 1. Mel-band statistics across time
     mel_means = np.mean(spec, axis=1)  # (n_mels,)
-    mel_stds = np.std(spec, axis=1)    # (n_mels,)
-    mel_maxs = np.max(spec, axis=1)    # (n_mels,)
-    mel_mins = np.min(spec, axis=1)    # (n_mels,)
+    mel_stds = np.std(spec, axis=1)  # (n_mels,)
+    mel_maxs = np.max(spec, axis=1)  # (n_mels,)
+    mel_mins = np.min(spec, axis=1)  # (n_mels,)
 
     # 2. Time-frame statistics across mel bands
     time_means = np.mean(spec, axis=0)
@@ -74,23 +80,29 @@ def extract_features_for_tabular(logmel: np.ndarray, audio: Optional[np.ndarray]
         mel_stds,
         mel_maxs,
         mel_mins,
-        np.array([
-            np.mean(time_means),
-            np.std(time_means),
-            np.mean(np.abs(time_delta)),
-            float(np.percentile(spec, 95) - np.percentile(spec, 5)),  # dynamic range
-        ])
+        np.array(
+            [
+                np.mean(time_means),
+                np.std(time_means),
+                np.mean(np.abs(time_delta)),
+                float(
+                    np.percentile(spec, 95) - np.percentile(spec, 5)
+                ),  # dynamic range
+            ]
+        ),
     ]
 
     # 3. Acoustic features
     if audio is not None and audio.size > 0:
-        ac = extract_acoustic_features(audio, sr=sr)
-        features.append(np.array(list(ac.values()), dtype=np.float32))
+        ac = extract_acoustic_features(audio, sample_rate=sr)
+        features.append(np.asarray(ac, dtype=np.float32).ravel())
 
     return np.concatenate(features).astype(np.float32)
 
 
-def heuristic_spoof_stub(logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 16000) -> float:
+def heuristic_spoof_stub(
+    logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 16000
+) -> float:
     """
     Realistic acoustic heuristic baseline stub.
 
@@ -172,7 +184,9 @@ def heuristic_spoof_stub(logmel: np.ndarray, audio: Optional[np.ndarray] = None,
     return spoof_prob
 
 
-def classify(logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 16000) -> Dict[str, Any]:
+def classify(
+    logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 16000
+) -> Dict[str, Any]:
     """
     Classify audio as 'bonafide' (genuine) or 'spoof' (AI-generated/deepfake).
 
@@ -199,7 +213,9 @@ def classify(logmel: np.ndarray, audio: Optional[np.ndarray] = None, sr: int = 1
                 spoof_prob = heuristic_spoof_stub(logmel, audio, sr)
             source = "lightgbm_weights"
         except Exception as e:
-            logger.warning(f"Inference error on trained model: {e}. Falling back to heuristic stub.")
+            logger.warning(
+                f"Inference error on trained model: {e}. Falling back to heuristic stub."
+            )
             spoof_prob = heuristic_spoof_stub(logmel, audio, sr)
             source = "heuristic_baseline"
     else:
